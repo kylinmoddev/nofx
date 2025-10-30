@@ -2,7 +2,7 @@ package trader
 
 import (
 	"context"
-	"crypto/ecdsa"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strconv"
@@ -20,7 +20,7 @@ type HyperliquidTrader struct {
 }
 
 // NewHyperliquidTrader 创建Hyperliquid交易器
-func NewHyperliquidTrader(privateKeyHex string, testnet bool) (*HyperliquidTrader, error) {
+func NewHyperliquidTrader(privateKeyHex string, walletAddr string, testnet bool) (*HyperliquidTrader, error) {
 	// 解析私钥
 	privateKey, err := crypto.HexToECDSA(privateKeyHex)
 	if err != nil {
@@ -33,13 +33,13 @@ func NewHyperliquidTrader(privateKeyHex string, testnet bool) (*HyperliquidTrade
 		apiURL = hyperliquid.TestnetAPIURL
 	}
 
-	// 从私钥生成钱包地址
-	pubKey := privateKey.Public()
-	publicKeyECDSA, ok := pubKey.(*ecdsa.PublicKey)
-	if !ok {
-		return nil, fmt.Errorf("无法转换公钥")
-	}
-	walletAddr := crypto.PubkeyToAddress(*publicKeyECDSA).Hex()
+	// // 从私钥生成钱包地址
+	// pubKey := privateKey.Public()
+	// publicKeyECDSA, ok := pubKey.(*ecdsa.PublicKey)
+	// if !ok {
+	// 	return nil, fmt.Errorf("无法转换公钥")
+	// }
+	// walletAddr := crypto.PubkeyToAddress(*publicKeyECDSA).Hex()
 
 	ctx := context.Background()
 
@@ -84,6 +84,11 @@ func (t *HyperliquidTrader) GetBalance() (map[string]interface{}, error) {
 	// 解析余额信息（MarginSummary字段都是string）
 	result := make(map[string]interface{})
 
+	// 🔍 调试：打印API返回的完整CrossMarginSummary结构
+	summaryJSON, _ := json.MarshalIndent(accountState.CrossMarginSummary, "  ", "  ")
+	log.Printf("🔍 [DEBUG] Hyperliquid API CrossMarginSummary完整数据:")
+	log.Printf("%s", string(summaryJSON))
+
 	accountValue, _ := strconv.ParseFloat(accountState.CrossMarginSummary.AccountValue, 64)
 	totalMarginUsed, _ := strconv.ParseFloat(accountState.CrossMarginSummary.TotalMarginUsed, 64)
 
@@ -95,19 +100,23 @@ func (t *HyperliquidTrader) GetBalance() (map[string]interface{}, error) {
 	}
 
 	// ✅ 正确理解Hyperliquid字段：
-	// AccountValue = 账户净值（包含未实现盈亏）= 这是真正的总资产
-	// 钱包余额（已实现）= AccountValue - 未实现盈亏
-	walletBalance := accountValue - totalUnrealizedPnl
+	// AccountValue = 总账户净值（已包含空闲资金+持仓价值+未实现盈亏）
+	// TotalMarginUsed = 持仓占用的保证金（已包含在AccountValue中，仅用于显示）
+	//
+	// 为了兼容auto_trader.go的计算逻辑（totalEquity = totalWalletBalance + totalUnrealizedProfit）
+	// 需要返回"不包含未实现盈亏的钱包余额"
+	walletBalanceWithoutUnrealized := accountValue - totalUnrealizedPnl
 
-	result["totalWalletBalance"] = walletBalance        // 钱包余额（已实现部分）
-	result["availableBalance"] = accountValue - totalMarginUsed  // 可用余额
-	result["totalUnrealizedProfit"] = totalUnrealizedPnl         // 未实现盈亏
+	result["totalWalletBalance"] = walletBalanceWithoutUnrealized // 钱包余额（不含未实现盈亏）
+	result["availableBalance"] = accountValue - totalMarginUsed   // 可用余额（总净值 - 占用保证金）
+	result["totalUnrealizedProfit"] = totalUnrealizedPnl          // 未实现盈亏
 
-	log.Printf("✓ Hyperliquid API返回: 账户净值=%.2f, 钱包余额=%.2f, 可用=%.2f, 未实现盈亏=%.2f",
+	log.Printf("✓ Hyperliquid 账户: 总净值=%.2f (钱包%.2f+未实现%.2f), 可用=%.2f, 保证金占用=%.2f",
 		accountValue,
-		result["totalWalletBalance"],
+		walletBalanceWithoutUnrealized,
+		totalUnrealizedPnl,
 		result["availableBalance"],
-		result["totalUnrealizedProfit"])
+		totalMarginUsed)
 
 	return result, nil
 }
@@ -515,8 +524,8 @@ func (t *HyperliquidTrader) SetStopLoss(symbol string, positionSide string, quan
 	order := hyperliquid.CreateOrderRequest{
 		Coin:  coin,
 		IsBuy: isBuy,
-		Size:  roundedQuantity,    // 使用四舍五入后的数量
-		Price: roundedStopPrice,   // 使用处理后的价格
+		Size:  roundedQuantity,  // 使用四舍五入后的数量
+		Price: roundedStopPrice, // 使用处理后的价格
 		OrderType: hyperliquid.OrderType{
 			Trigger: &hyperliquid.TriggerOrderType{
 				TriggerPx: roundedStopPrice,
@@ -552,8 +561,8 @@ func (t *HyperliquidTrader) SetTakeProfit(symbol string, positionSide string, qu
 	order := hyperliquid.CreateOrderRequest{
 		Coin:  coin,
 		IsBuy: isBuy,
-		Size:  roundedQuantity,          // 使用四舍五入后的数量
-		Price: roundedTakeProfitPrice,   // 使用处理后的价格
+		Size:  roundedQuantity,        // 使用四舍五入后的数量
+		Price: roundedTakeProfitPrice, // 使用处理后的价格
 		OrderType: hyperliquid.OrderType{
 			Trigger: &hyperliquid.TriggerOrderType{
 				TriggerPx: roundedTakeProfitPrice,
@@ -577,7 +586,7 @@ func (t *HyperliquidTrader) SetTakeProfit(symbol string, positionSide string, qu
 func (t *HyperliquidTrader) FormatQuantity(symbol string, quantity float64) (string, error) {
 	coin := convertSymbolToHyperliquid(symbol)
 	szDecimals := t.getSzDecimals(coin)
-	
+
 	// 使用szDecimals格式化数量
 	formatStr := fmt.Sprintf("%%.%df", szDecimals)
 	return fmt.Sprintf(formatStr, quantity), nil
@@ -604,13 +613,13 @@ func (t *HyperliquidTrader) getSzDecimals(coin string) int {
 // roundToSzDecimals 将数量四舍五入到正确的精度
 func (t *HyperliquidTrader) roundToSzDecimals(coin string, quantity float64) float64 {
 	szDecimals := t.getSzDecimals(coin)
-	
+
 	// 计算倍数（10^szDecimals）
 	multiplier := 1.0
 	for i := 0; i < szDecimals; i++ {
 		multiplier *= 10.0
 	}
-	
+
 	// 四舍五入
 	return float64(int(quantity*multiplier+0.5)) / multiplier
 }
@@ -621,9 +630,9 @@ func (t *HyperliquidTrader) roundPriceToSigfigs(price float64) float64 {
 	if price == 0 {
 		return 0
 	}
-	
+
 	const sigfigs = 5 // Hyperliquid标准：5位有效数字
-	
+
 	// 计算价格的数量级
 	var magnitude float64
 	if price < 0 {
@@ -631,7 +640,7 @@ func (t *HyperliquidTrader) roundPriceToSigfigs(price float64) float64 {
 	} else {
 		magnitude = price
 	}
-	
+
 	// 计算需要的倍数
 	multiplier := 1.0
 	for magnitude >= 10 {
@@ -642,12 +651,12 @@ func (t *HyperliquidTrader) roundPriceToSigfigs(price float64) float64 {
 		magnitude *= 10
 		multiplier *= 10
 	}
-	
+
 	// 应用有效数字精度
 	for i := 0; i < sigfigs-1; i++ {
 		multiplier *= 10
 	}
-	
+
 	// 四舍五入
 	rounded := float64(int(price*multiplier+0.5)) / multiplier
 	return rounded
